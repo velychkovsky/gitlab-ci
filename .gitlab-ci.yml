@@ -1,0 +1,135 @@
+cache:
+  paths:
+    - node_modules/
+
+stages:
+  - version
+  - build
+  - dockerize
+  - deploy
+
+variables:
+  PROD_DOMAIN: prod.example.com
+  DEV_DOMAIN: dev.example.com
+  DOCKER_REGISTRY: registry.example.com
+  PROJECT_TAG: moon
+  CONTAINER_IMAGE: ${DOCKER_REGISTRY}/${PROJECT_TAG}/app
+
+version:
+  image: node:10.15.0-stretch
+  tags:
+    - builder
+  stage: version
+  script:
+    - git config --global user.name "$GITLAB_USER_NAME"
+    - git config --global user.email "$GITLAB_USER_EMAIL"
+    - git remote set-url origin "https://gitlab-ci-token:$GIT_ACCESS_TOKEN@$CI_SERVER_HOST/$CI_PROJECT_PATH.git"
+    - npm --allow-same-version --no-git-tag-version version patch
+    - VERSION=`npm --allow-same-version --no-git-tag-version version patch`
+    - 'git commit -am "$VERSION [skip ci]"'
+    - git push origin HEAD:master
+  only:
+    - master
+
+.build: &build
+  image: node:10.15.0-stretch
+  tags:
+    - builder
+  stage: build
+
+build_master:
+  <<: *build
+  only:
+    - master
+  script:
+    - git pull origin HEAD
+    - npm install -g @vue/cli@latest
+    - npm install
+    - npm run build
+    - cp -v .htaccess dist/
+  artifacts:
+    paths:
+      - dist
+
+build:
+  <<: *build
+  only:
+    - development
+    - staging
+    - production
+  script:
+    - npm install -g @vue/cli@latest
+    - npm install
+    - npm run build
+    - cp -v .htaccess dist/
+
+dockerize:
+  image: gitlab/dind
+  tags:
+    - builder
+  stage: dockerize
+  only:
+    - staging
+    - production
+  script:
+    - docker login -u ${DOCKER_REGISTRY_USER} -p ${DOCKER_REGISTRY_PASS} ${DOCKER_REGISTRY}
+    - docker build  -t ${CONTAINER_IMAGE}:${CI_COMMIT_REF_NAME} .
+    - docker tag ${CONTAINER_IMAGE}:${CI_COMMIT_REF_NAME} ${CONTAINER_IMAGE}:${CI_COMMIT_SHA}
+    - docker push ${CONTAINER_IMAGE}:${CI_COMMIT_REF_NAME}
+    - docker push ${CONTAINER_IMAGE}:${CI_COMMIT_SHA}
+
+
+.deploy_to_prod: &deploy_prod
+  stage: deploy
+  script:
+    - docker login -u ${DOCKER_REGISTRY_USER} -p ${DOCKER_REGISTRY_PASS} ${DOCKER_REGISTRY}
+    - docker stack deploy --with-registry-auth --prune --compose-file=docker-stack.yml panel_${CI_COMMIT_REF_NAME}
+
+deploy_staging:
+  tags:
+    - deployer
+  <<: *deploy_prod
+  variables:
+    VIRTUAL_HOST: ${CI_COMMIT_REF_NAME}.${PROD_DOMAIN}
+  only:
+    - staging
+
+deploy_production:
+  tags:
+    - deployer
+  <<: *deploy_prod
+  variables:
+    VIRTUAL_HOST: ${PROD_DOMAIN}
+  only:
+    - production
+  when: manual
+
+
+.deploy_to_dev: &deploy_dev
+  stage: deploy
+  image: instrumentisto/rsync-ssh
+  script:
+    - mkdir ~/.ssh/
+    - 'echo -e "Host *\n\tStrictHostKeyChecking no\n\n" > ~/.ssh/config'
+    - eval `ssh-agent`
+    - chmod 400 ${SSH_STAGE_KEY}
+    - ssh-add ${SSH_STAGE_KEY}
+    - rsync -aHv --delete  dist/ ${SSH_STAGE_USER}@${SSH_STAGE_ADDR}:${DOCUMENT_ROOT}
+
+deploy_dev:
+  tags:
+    - builder
+  <<: *deploy_dev
+  variables:
+    DOCUMENT_ROOT: /var/www/dev.example.com
+  only:
+    - development
+
+deploy_master:
+  tags:
+    - builder
+  <<: *deploy_dev
+  variables:
+    DOCUMENT_ROOT: /var/www/prod.example.com
+  only:
+    - master
